@@ -5,8 +5,10 @@ import hudson.FilePath;
 import hudson.Launcher;
 import hudson.Launcher.ProcStarter;
 import hudson.Proc;
+import hudson.model.BuildListener;
 import hudson.model.AbstractBuild;
-import hudson.model.Hudson;
+import hudson.model.Computer;
+import hudson.model.JDK;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -23,175 +25,202 @@ import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import jenkins.model.Jenkins;
+
 /**
- *  
+ * 
  * @author Tim Bacon
  */
 public class FitnesseExecutor {
 	private static final int SLEEP_MILLIS = 1000;
-	private static final int STARTUP_TIMEOUT_MILLIS = 10*1000;
-	private static final int ADDITIONAL_TIMEOUT_MILLIS = 20*1000;
-	
+	private static final int STARTUP_TIMEOUT_MILLIS = 30 * 1000;
+	private static final int READ_PAGE_TIMEOUT = 10 * 1000;
+
 	private final FitnesseBuilder builder;
-	
-	public FitnesseExecutor(FitnesseBuilder builder) {
+	private final EnvVars envVars;
+	private final PrintStream logger;
+	private final BuildListener listener;
+
+	public FitnesseExecutor(FitnesseBuilder builder, BuildListener listener, EnvVars envVars) {
 		this.builder = builder;
+		this.listener = listener;
+		this.envVars = envVars;
+		this.logger = listener.getLogger();
 	}
 
-    public boolean execute(AbstractBuild<?, ?> build, Launcher launcher, PrintStream logger, EnvVars environment) 
-    throws InterruptedException {
+	public boolean execute(Launcher launcher, AbstractBuild<?, ?> build) throws InterruptedException {
 		Proc fitnesseProc = null;
-		StdConsole console = new StdConsole();
 		try {
 			build.addAction(getFitnesseBuildAction(build));
-	    	if (builder.getFitnesseStart()) {
-	    		fitnesseProc = startFitnesse(build, launcher, environment, logger, console);
-	    		if (!procStarted(fitnesseProc, logger, console)) {
-    				return false;
-	    		}
-	    		console.logIncrementalOutput(logger);
-	    	}
-	    	
-	    	FilePath resultsFilePath = getResultsFilePath(getWorkingDirectory(build), 
-	    												builder.getFitnessePathToXmlResultsOut());
-			readAndWriteFitnesseResults(logger, console, getFitnessePageCmdURL(build), resultsFilePath);
+			FilePath workingDirectory = getWorkingDirectory(logger, build);
+			if (builder.getFitnesseStart()) {
+				fitnesseProc = startFitnesse(workingDirectory, launcher);
+				if (!fitnesseProc.isAlive() || !isFitnesseStarted(getFitnessePage(build, false))) {
+					return false;
+				}
+			}
+
+			FilePath resultsFilePath = getFilePath(logger, workingDirectory, builder.getFitnessePathToXmlResultsOut(envVars));
+			readAndWriteFitnesseResults(getFitnessePage(build, true), resultsFilePath);
 			return true;
 		} catch (Throwable t) {
 			t.printStackTrace(logger);
-			if (t instanceof InterruptedException) throw (InterruptedException) t;
+			if (t instanceof InterruptedException)
+				throw (InterruptedException) t;
 			return false;
 		} finally {
-			killProc(logger, fitnesseProc);
-			console.logIncrementalOutput(logger);
+			killProc(fitnesseProc);
 		}
 	}
 
-	private FitnesseBuildAction getFitnesseBuildAction(AbstractBuild<?,?> build) throws InterruptedException, IOException {
-		return new FitnesseBuildAction(
-				builder.getFitnesseStart(),
-				builder.getFitnesseHost(build), 
-				builder.getFitnessePort());
+	private FitnesseBuildAction getFitnesseBuildAction(AbstractBuild<?, ?> build) throws IOException {
+		return new FitnesseBuildAction(builder.getFitnesseStart(), builder.getFitnesseHost(build, envVars),
+				builder.getFitnessePort(envVars));
 	}
 
-	private Proc startFitnesse(AbstractBuild<?,?> build, Launcher launcher, EnvVars envVars, PrintStream logger, StdConsole console) throws IOException {
+	private Proc startFitnesse(FilePath workingDirectory, Launcher launcher) throws IOException, InterruptedException {
 		logger.println("Starting new Fitnesse instance...");
-		ProcStarter procStarter = launcher.launch().cmds(getJavaCmd(getWorkingDirectory(build), envVars));
-		procStarter.pwd(new File(getAbsolutePathToFileThatMayBeRelativeToWorkspace(getWorkingDirectory(build), builder.getFitnesseJavaWorkingDirectory())));
-    	console.provideStdOutAndStdErrFor(procStarter);
+		ProcStarter procStarter = launcher.launch().cmds(getJavaCmd(workingDirectory));
+		procStarter.pwd(getFilePath(workingDirectory, builder.getFitnesseJavaWorkingDirectory()));
+		procStarter.stdout(logger).stderr(logger);
 		return procStarter.start();
-    }
+	}
 
-	public ArrayList<String> getJavaCmd(FilePath workingDirectory, EnvVars envVars) {
-		String java = "java"; 
-		if(!builder.getFitnesseJdk().isEmpty()){
-		   File customJavaHome = Hudson.getInstance().getJDK(builder.getFitnesseJdk()).getBinDir();
-		   java = new File(customJavaHome, java).getAbsolutePath();
-		} else if (envVars.containsKey("JAVA_HOME")) {
-			java = new File(new File(envVars.get("JAVA_HOME"), "bin"), java).getAbsolutePath();
+	public ArrayList<String> getJavaCmd(FilePath workingDirectory) throws IOException, InterruptedException {
+		String java = null;
+
+		// master/salve configuration
+		if (!builder.getFitnesseJdk(envVars).isEmpty()) {
+			JDK jdk = Jenkins.getInstance().getJDK(builder.getFitnesseJdk(envVars));
+			if (jdk != null) {
+				jdk = jdk.forNode(Computer.currentComputer().getNode(), listener);
+				java = getJavaBinFromjavaHome(workingDirectory, jdk.getHome());
+			}
 		}
-		
-		String fitnesseJavaOpts = builder.getFitnesseJavaOpts();
+		// env variable
+		if (java == null && envVars.containsKey("JAVA_HOME")) {
+			java = getJavaBinFromjavaHome(workingDirectory, envVars.get("JAVA_HOME"));
+		}
+		// default: use java declared in path
+		if (java == null) {
+			java = "java";
+		}
+
+		String fitnesseJavaOpts = builder.getFitnesseJavaOpts(envVars);
 		String[] java_opts = ("".equals(fitnesseJavaOpts) ? new String[0] : fitnesseJavaOpts.split(" "));
 
-		String absolutePathToFitnesseJar = getAbsolutePathToFileThatMayBeRelativeToWorkspace(workingDirectory, builder.getFitnessePathToJar());
-		String[] jar_opts = {"-jar", absolutePathToFitnesseJar};
-		
-		File fitNesseRoot = new File(getAbsolutePathToFileThatMayBeRelativeToWorkspace(workingDirectory, builder.getFitnessePathToRoot()));
-		String[] fitnesse_opts = {"-d", fitNesseRoot.getParent(), 
-				"-r", fitNesseRoot.getName(), 
-				"-p", Integer.toString(builder.getFitnessePort())};
-		
+		String absolutePathToFitnesseJar = getAbsolutePathToFile(workingDirectory, builder.getFitnessePathToJar());
+		String[] jar_opts = { "-jar", absolutePathToFitnesseJar };
+
+		FilePath absolutePathToFitNesseRoot = getFilePath(workingDirectory, builder.getFitnessePathToRoot());
+		String[] fitnesse_opts = { // --
+		"-d", absolutePathToFitNesseRoot.getParent().getRemote(), // --
+				"-r", absolutePathToFitNesseRoot.getName(), // --
+				"-p", Integer.toString(builder.getFitnessePort(envVars)) };
+
 		// split additional fitness options and add them to those explicitly configured ones
 		String[] addOps = splitOptions(builder.getAdditionalFitnesseOptions());
-		
-		String[] fitnesse_opts2 = new String[fitnesse_opts.length
-				+ addOps.length];
-		System.arraycopy(fitnesse_opts, 0, fitnesse_opts2, 0,
-				fitnesse_opts.length);
-		System.arraycopy(addOps, 0, fitnesse_opts2, fitnesse_opts.length,
-				addOps.length);
-	
+
+		String[] fitnesse_opts2 = new String[fitnesse_opts.length + addOps.length];
+		System.arraycopy(fitnesse_opts, 0, fitnesse_opts2, 0, fitnesse_opts.length);
+		System.arraycopy(addOps, 0, fitnesse_opts2, fitnesse_opts.length, addOps.length);
+
 		ArrayList<String> cmd = new ArrayList<String>();
 		cmd.add(java);
-		if (java_opts.length > 0) cmd.addAll(Arrays.asList(java_opts));
+		if (java_opts.length > 0)
+			cmd.addAll(Arrays.asList(java_opts));
 		cmd.addAll(Arrays.asList(jar_opts));
 		cmd.addAll(Arrays.asList(fitnesse_opts2));
-		
+
 		return cmd;
 	}
-	
+
+	private String getJavaBinFromjavaHome(FilePath workingDirectory, String javaHome) throws IOException,
+			InterruptedException {
+		FilePath javaHomePath = getFilePath(workingDirectory, javaHome);
+		if (javaHomePath.exists()) {
+			return javaHomePath.child("bin").child("java").getRemote();
+		}
+		return null;
+	}
+
 	/**
-	 * Breaks the given string down by any options of the form "-x" or "-x some argument not containing a - character"
+	 * Breaks the given string down by any options of the form "-x" or
+	 * "-x some argument not containing a - character"
 	 */
 	private static String[] splitOptions(String string) {
-		List<String> addOps = new ArrayList<String>(); 
-		
+		List<String> addOps = new ArrayList<String>();
+
 		// match pattern to identify additional cmd arguments
 		Pattern pattern = Pattern.compile("-{1}[a-z]{1}\\s?[^-]*");
 		Matcher m = pattern.matcher(string);
-		
+
 		while (m.find()) {
-		    String s = m.group();
-		    addOps.add(s.substring(0,2).trim());
-		    addOps.add(s.substring(2,s.length()).trim());
+			String s = m.group();
+			addOps.add(s.substring(0, 2).trim());
+			addOps.add(s.substring(2, s.length()).trim());
 		}
 		String[] ret = new String[addOps.size()];
 		return addOps.toArray(ret);
 	}
-    
-	private boolean procStarted(Proc fitnesseProc, PrintStream log, StdConsole console) throws IOException, InterruptedException {
-		if (fitnesseProc.isAlive()) {
-			return fitnesseStarted(log, console, STARTUP_TIMEOUT_MILLIS);
-		}
-		return false;
-	}
-	
+
 	/**
-	 * Detect if fitnesse has started by monitoring the console.
-	 * If fitnesse.jar is unpacking itself there will be an initial write
-	 * to stderr followed by multiple writes to stdout, otherwise there 
-	 * should only be an initial short write to stdout (and any writes to stderr
-	 * are probably exception messages.) 
+	 * Detect if fitnesse has started by try to do an HTTP connection
+	 * 
 	 * @return true if fitnesse has started, false otherwise
 	 */
-	public boolean fitnesseStarted(PrintStream log, StdConsole console, long timeout) throws InterruptedException {
-		long waitedAlready = 0;
-		do {
-			Thread.sleep(SLEEP_MILLIS);
-			if (console.noIncrementalOutput()) {
-				waitedAlready += SLEEP_MILLIS;
-			} else {
-				if (console.incrementalOutputOnStdErr()) 
-					timeout += ADDITIONAL_TIMEOUT_MILLIS;
-				console.logIncrementalOutput(log);
+	public boolean isFitnesseStarted(URL fitnessePageURL) throws InterruptedException {
+		long waitedAlready;
+		boolean launched = false;
+		logger.println("Wait for Fitnesse Server start");
+		for (waitedAlready = 0; waitedAlready < STARTUP_TIMEOUT_MILLIS; waitedAlready += SLEEP_MILLIS) {
+			HttpURLConnection connection = null;
+			try {
+				connection = (HttpURLConnection) fitnessePageURL.openConnection();
+				connection.setRequestMethod("GET"); // HEAD is not allowed on Fitnesse
+																						// server (error 400)
+				connection.setReadTimeout(READ_PAGE_TIMEOUT);
+				int responseCode = connection.getResponseCode();
+				if (responseCode != 200)
+					throw new RuntimeException(String.format("Response for page %s is %d", fitnessePageURL, responseCode));
+				launched = true;
+				break;
+			} catch (IOException e) {
+				logger.print('.');
+				logger.flush();
+				Thread.sleep(SLEEP_MILLIS);
+				launched = false;
+			} finally {
+				if (connection != null)
+					connection.disconnect();
 			}
-		} while (waitedAlready < timeout) ;
-
-		if (console.noOutputOnStdOut()) {
-			log.println("Waited " + waitedAlready + "ms for fitnesse to start.");
-			return false;
 		}
-		return true;
+
+		logger.printf(launched // --
+		? "%nFitnesse server started in %sms.%n" // --
+				: "%nFitnesse server NOT started in %sms on URL: %s%n", waitedAlready, fitnessePageURL);
+
+		return launched;
 	}
 
-	private void killProc(PrintStream log, Proc proc) {
+	private void killProc(Proc proc) {
 		if (proc != null) {
 			try {
 				proc.kill();
-				for (int i=0; i < 4; ++i) {
-					if (proc.isAlive()) Thread.sleep(SLEEP_MILLIS);
+				for (int i = 0; i < 4; ++i) {
+					if (proc.isAlive())
+						Thread.sleep(SLEEP_MILLIS);
 				}
 			} catch (Exception e) {
-				e.printStackTrace(log);
+				e.printStackTrace(logger);
 			}
 		}
 	}
-	
-	private void readAndWriteFitnesseResults(final PrintStream logger, final StdConsole console,
-											final URL readFromURL, final FilePath writeToFilePath)	
-	throws InterruptedException {
-		final RunnerWithTimeOut runnerWithTimeOut = new RunnerWithTimeOut(builder.getFitnesseTestTimeout());
-	
+
+	private void readAndWriteFitnesseResults(final URL readFromURL, final FilePath writeToFilePath)
+			throws InterruptedException {
+		final RunnerWithTimeOut runnerWithTimeOut = new RunnerWithTimeOut(builder.getFitnesseTestTimeout(envVars));
+
 		Runnable readAndWriteResults = new Runnable() {
 			public void run() {
 				try {
@@ -199,30 +228,23 @@ public class FitnesseExecutor {
 				} catch (Exception e) {
 					// swallow - file may not exist
 				}
-				final byte[] bytes = getHttpBytes(logger, readFromURL, runnerWithTimeOut,
-						builder.getFitnesseHttpTimeout());
-				writeFitnesseResults(logger, writeToFilePath, bytes); 
+				final byte[] bytes = getHttpBytes(readFromURL, runnerWithTimeOut, builder.getFitnesseHttpTimeout(envVars));
+				writeFitnesseResults(writeToFilePath, bytes);
 			}
 		};
-		
-		ResetEvent logToConsole = new ResetEvent() {
-			public void onReset() {
-				console.logIncrementalOutput(logger);
-			}
-		};
-		
-		runnerWithTimeOut.run(readAndWriteResults, logToConsole);
+
+		runnerWithTimeOut.run(readAndWriteResults);
 	}
-	
-	public byte[] getHttpBytes(PrintStream log, URL pageCmdTarget, Resettable timeout, int httpTimeout) {
+
+	public byte[] getHttpBytes(URL pageCmdTarget, Resettable timeout, int httpTimeout) {
 		InputStream inputStream = null;
 		ByteArrayOutputStream bucket = new ByteArrayOutputStream();
 
 		try {
-			log.println("Connnecting to " + pageCmdTarget);
+			logger.println("Connnecting to " + pageCmdTarget);
 			HttpURLConnection connection = (HttpURLConnection) pageCmdTarget.openConnection();
 			connection.setReadTimeout(httpTimeout);
-			log.println("Connected: " + connection.getResponseCode() + "/" + connection.getResponseMessage());
+			logger.println("Connected: " + connection.getResponseCode() + "/" + connection.getResponseMessage());
 
 			inputStream = connection.getInputStream();
 			long recvd = 0, lastLogged = 0;
@@ -233,21 +255,21 @@ public class FitnesseExecutor {
 				timeout.reset();
 				recvd += lastRead;
 				if (recvd - lastLogged > 1024) {
-					log.println(recvd/1024 + "k...");
+					logger.println(recvd / 1024 + "k...");
 					lastLogged = recvd;
 				}
 			}
 		} catch (IOException e) {
 			// this may be a "premature EOF" caused by e.g. incorrect content-length HTTP header
 			// so it may be non-fatal -- try to recover
-			e.printStackTrace(log);
+			e.printStackTrace(logger);
 		} finally {
 			if (inputStream != null) {
 				try {
-					log.println("Force close of input stream.");
+					logger.println("Force close of input stream.");
 					inputStream.close();
 				} catch (Exception e) {
-					log.println("Caught exception while trying to close input stream.");
+					logger.println("Caught exception while trying to close input stream.");
 					// swallow
 				}
 			}
@@ -255,67 +277,85 @@ public class FitnesseExecutor {
 		return bucket.toByteArray();
 	}
 
-	public URL getFitnessePageCmdURL(AbstractBuild<?,?> build) throws Exception {
-		return new URL("http", 
-				builder.getFitnesseHost(build), 
-				builder.getFitnessePort(), 
-				getFitnessePageCmd());
-	}	
-
-	public String getFitnessePageCmd() {
-		String targetPageExpression = builder.getFitnesseTargetPage();
-		if (targetPageExpression.contains("?"))
-			return "/" + targetPageExpression+"&format=xml&includehtml";
-		
-		int pos = targetPageExpression.indexOf('&');
-		if (pos == -1) pos = targetPageExpression.length();
-		
-		return String.format("/%1$s?%2$s%3$s", 
-				targetPageExpression.substring(0, pos),
-				builder.getFitnesseTargetIsSuite() ? "suite" : "test",
-				targetPageExpression.substring(pos)+"&format=xml&includehtml");
+	/* package for test */URL getFitnessePage(AbstractBuild<?, ?> build, boolean withCommand) throws IOException {
+		return new URL("http", //
+				builder.getFitnesseHost(build, envVars), //
+				builder.getFitnessePort(envVars), //
+				withCommand ? getFitnessePageCmd() : getFitnessePageBase());
 	}
 
-	private void writeFitnesseResults(PrintStream log, FilePath resultsFilePath, byte[] results) {
+	/* package for test */String getFitnessePageBase() {
+		String targetPageExpression = builder.getFitnesseTargetPage(envVars);
+		int pos = targetPageExpression.indexOf('?');
+		if (pos == -1)
+			pos = targetPageExpression.length();
+		return "/" + targetPageExpression.substring(0, pos);
+	}
+
+	/* package for test */String getFitnessePageCmd() {
+		String targetPageExpression = builder.getFitnesseTargetPage(envVars);
+		if (targetPageExpression.contains("?"))
+			return "/" + targetPageExpression + "&format=xml&includehtml";
+
+		int pos = targetPageExpression.indexOf('&');
+		if (pos == -1)
+			pos = targetPageExpression.length();
+
+		return String.format("/%1$s?%2$s%3$s", targetPageExpression.substring(0, pos),
+				builder.getFitnesseTargetIsSuite() ? "suite" : "test", targetPageExpression.substring(pos)
+						+ "&format=xml&includehtml");
+	}
+
+	private void writeFitnesseResults(FilePath resultsFilePath, byte[] results) {
 		OutputStream resultsStream = null;
 		try {
 			resultsStream = resultsFilePath.write();
 			resultsStream.write(results);
-			log.println("Xml results saved as " + Charset.defaultCharset().displayName()
-					+ " to " + resultsFilePath.getRemote());
+			logger.println("Xml results saved as " + Charset.defaultCharset().displayName() + " to "
+					+ resultsFilePath.getRemote());
 		} catch (IOException e) {
-			e.printStackTrace(log);
+			e.printStackTrace(logger);
 		} catch (InterruptedException e2) {
-			e2.printStackTrace(log);
+			e2.printStackTrace(logger);
 		} finally {
 			try {
-				if (resultsStream != null) resultsStream.close();
+				if (resultsStream != null)
+					resultsStream.close();
 			} catch (Exception e) {
 				// swallow
 			}
 		}
 	}
 
-	static FilePath getWorkingDirectory(AbstractBuild<?, ?> build) {
-		FilePath workspace = build.getWorkspace();
-		if (workspace != null) return workspace;
-		return new FilePath(build.getRootDir());
+	String getAbsolutePathToFile(FilePath workingDirectory, String fileName) {
+		return getFilePath(workingDirectory, fileName).getRemote();
 	}
-	
-	static FilePath getResultsFilePath(FilePath workingDirectory, String fileName) {
-		File fileNameFile = new File(fileName);
-		
-		if (fileNameFile.getParent() != null) {
-			if (fileNameFile.exists() || fileNameFile.getParentFile().exists()) {
-				return new FilePath(fileNameFile);
+
+	FilePath getFilePath(FilePath workingDirectory, String fileName) {
+		return getFilePath(logger, workingDirectory, fileName);
+	}
+
+	static FilePath getWorkingDirectory(PrintStream logger, AbstractBuild<?, ?> build) {
+		FilePath workspace = build.getWorkspace(); // null only is slave is disconnected
+		logger.println("Working directory is: " + workspace != null ? workspace.getRemote() : "null !!");
+		return workspace;
+	}
+
+	static FilePath getFilePath(PrintStream logger, FilePath workingDirectory, String fileName) {
+		if (workingDirectory != null) {
+			FilePath fp = workingDirectory.child(fileName); // manage absolute and relative path
+			try {
+				if (!fp.exists()) {
+					logger.printf("Can't find target file: %s with working directory: %s%n", fileName, workingDirectory);
+				}
+			} catch (Exception e) {
+				logger.printf("Can't check if remote file exist: %s%n", e.getMessage());
 			}
+			return fp;
+		} else { // possible ?
+			logger.println("Warning: working directory is null.");
+			File fileNameFile = new File(fileName); // should not work on slave if OS is different than masters' one
+			return new FilePath(fileNameFile);
 		}
-		
-		return workingDirectory.child(fileName);
-	}
-	
-	static String getAbsolutePathToFileThatMayBeRelativeToWorkspace(FilePath workingDirectory, String fileName) {
-		if (new File(fileName).exists()) return fileName;
-		return new File(workingDirectory.getRemote(), fileName).getAbsolutePath();
 	}
 }

@@ -7,6 +7,7 @@ public class RunnerWithTimeOutTest {
 	private RunnerWithTimeOut runner;
 
 	private boolean wasRun;
+
 	@Test
 	public void startedRunnerShouldRunRunnable() throws Exception {
 		wasRun = false;
@@ -20,7 +21,7 @@ public class RunnerWithTimeOutTest {
 		Assert.assertTrue(wasRun);
 	}
 
-	@Test(expected=InterruptedException.class)
+	@Test(expected = InterruptedException.class)
 	public void startedRunnerShouldThrowExceptionAfterTimeout() throws Exception {
 		runner = new RunnerWithTimeOut(100);
 		runner.run(new Runnable() {
@@ -51,23 +52,5 @@ public class RunnerWithTimeOutTest {
 				}
 			}
 		});
-	}
-	
-	private boolean eventWasFired;
-	@Test
-	public void resettingRunnerWithResetEventShouldFireResetEvent() throws Exception {
-		eventWasFired = false;
-		runner = new RunnerWithTimeOut(100);
-		final Resettable resettable = runner;
-		runner.run(new Runnable() {
-			public void run() {
-				resettable.reset();
-			}
-		}, new ResetEvent() {
-			public void onReset() {
-				eventWasFired = true;
-			}
-		});
-		Assert.assertTrue(eventWasFired);
 	}
 }

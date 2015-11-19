@@ -3,9 +3,7 @@ package hudson.plugins.fitnesse;
 import hudson.FilePath;
 import hudson.tasks.test.TestResult;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.PrintStream;
 import java.util.Collection;
 
 import org.junit.Assert;
@@ -19,22 +17,22 @@ public class FitnesseResultsRecorderTest {
 		startPlugin();
 		String resultsFile = "src/test/resources/hudson/plugins/fitnesse/fitnesse-test-results.xml";
 		FitnesseResultsRecorder recorder = new FitnesseResultsRecorder(resultsFile);
-		ByteArrayOutputStream log = new ByteArrayOutputStream();
-		Assert.assertNotNull(recorder.getResults(new PrintStream(log), 
-				new FilePath(new File(System.getProperty("user.dir"))).child(resultsFile)));
+		FilePath resultFile = new FilePath(new File(System.getProperty("user.dir"))).child(resultsFile);
+		Assert.assertNotNull(recorder.getResults(System.out, resultFile, new File("./target")));
 	}
 
 	@Test
 	public void getPatternResults() throws Exception {
 		startPlugin();
 		String resultsFile = "src/test/resources/hudson/plugins/fitnesse/fitnesse-*-results.xml";
+
 		FitnesseResultsRecorder recorder = new FitnesseResultsRecorder(resultsFile);
-		ByteArrayOutputStream log = new ByteArrayOutputStream();
-		FilePath[] resultFiles = recorder.getResultFiles(new FilePath(new File(System.getProperty("user.dir"))));
+		FilePath[] resultFiles = recorder
+				.getResultFiles(System.out, new FilePath(new File(System.getProperty("user.dir"))));
 		Assert.assertNotNull(resultFiles);
 		Assert.assertEquals(2, resultFiles.length);
 
-		FitnesseResults results = recorder.getResults(new PrintStream(log), resultFiles);
+		FitnesseResults results = recorder.getResults(System.out, resultFiles, new File("./target"));
 		Assert.assertNotNull(results);
 		Assert.assertTrue(results.hasChildren());
 		Collection<? extends TestResult> children = results.getChildren();

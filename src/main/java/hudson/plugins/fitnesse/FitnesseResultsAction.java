@@ -5,14 +5,13 @@ import hudson.tasks.test.AbstractTestResultAction;
 
 import org.kohsuke.stapler.StaplerProxy;
 
+
 public class FitnesseResultsAction extends AbstractTestResultAction<FitnesseResultsAction> implements StaplerProxy {
-	private static final long serialVersionUID = 1L;
 	private FitnesseResults results;
-	
+
 	protected FitnesseResultsAction(AbstractBuild<?, ?> owner, FitnesseResults results) {
-		super(owner);
 		this.results = results;
-		results.setOwner(owner);
+		this.results.setOwner(owner);
 	}
 
 	@Override
@@ -70,7 +69,7 @@ public class FitnesseResultsAction extends AbstractTestResultAction<FitnesseResu
 	 * Referenced in summary.jelly and FitnesseProjectAction/jobMain.jelly
 	 */
 	public String getSummary() {
-		return String.format("(%s, %d pages: %d wrong or with exceptions, %d ignored)",
-				getResult().getName(), getTotalCount(), getFailCount(), getSkipCount());
+		return String.format("(%d pages: %d wrong or with exceptions, %d ignored)", getTotalCount(), getFailCount(),
+				getSkipCount());
 	}
 }
