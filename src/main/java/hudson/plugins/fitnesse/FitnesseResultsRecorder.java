@@ -171,6 +171,8 @@ public class FitnesseResultsRecorder extends Recorder {
 		return result;
 	}
 
+        private static final DescriptorImpl DESCRIPTOR = new DescriptorImpl();
+        
 	/**
 	 * See <tt>src/main/resources/hudson/plugins/fitnesse/FitnesseResultsRecorder/config.jelly</tt>
 	 */
